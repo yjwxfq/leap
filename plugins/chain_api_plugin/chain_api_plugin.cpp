@@ -154,8 +154,45 @@ void chain_api_plugin::plugin_startup() {
       CHAIN_RW_CALL_ASYNC(push_transaction, chain_apis::read_write::push_transaction_results, 202, http_params_types::params_required),
       CHAIN_RW_CALL_ASYNC(push_transactions, chain_apis::read_write::push_transactions_results, 202, http_params_types::params_required),
       CHAIN_RW_CALL_ASYNC(send_transaction, chain_apis::read_write::send_transaction_results, 202, http_params_types::params_required),
-      CHAIN_RW_CALL_ASYNC(send_transaction2, chain_apis::read_write::send_transaction_results, 202, http_params_types::params_required)
+      CHAIN_RW_CALL_ASYNC(send_transaction2, chain_apis::read_write::send_transaction_results, 202, http_params_types::params_required),
    }, appbase::exec_queue::read_only);
+
+    _http_plugin.add_api({{std::string("/v1/" "chain" "/" "send_transaction3"), api_category::chain_rw,
+                           [rw_api, &_http_plugin](string &&, string &&body, url_response_callback &&cb)mutable {
+        rw_api.start();
+        try {
+            auto params = parse_params<chain_apis::read_write::send_transaction_params, http_params_types::params_required>(
+                    body);
+            using http_fwd_t = std::function<chain::t_or_exception<chain_apis::read_write::send_transaction_results>()>;
+            rw_api.send_transaction(std::move(params), [&_http_plugin, cb = std::move(cb), body = std::move(body)](
+                    const chain::next_function_variant<chain_apis::read_write::send_transaction_results> &result)mutable {
+                if (std::holds_alternative<fc::exception_ptr>(result)) {
+                    try {
+                        std::get<fc::exception_ptr>(result)->dynamic_rethrow_exception();
+                    } catch (...) { http_plugin::handle_exception("chain", "send_transaction", body, cb); }
+                } else if (std::holds_alternative<chain_apis::read_write::send_transaction_results>(result)) {
+                    cb(202, fc::variant(std::get<chain_apis::read_write::send_transaction_results>(
+                            std::move(result))));
+                } else {
+                    (__builtin_expect(!(std::holds_alternative<http_fwd_t>(result)), 0) ? __assert_rtn(
+                            "_function_name_", "_file_name_short_", 156,
+                            "std::holds_alternative<http_fwd_t>(result)") : (void) 0);
+                    _http_plugin.post_http_thread_pool([resp_code = 202, cb = std::move(cb), body = std::move(
+                            body), http_fwd = std::get<http_fwd_t>(std::move(result))]() {
+                        chain::t_or_exception<chain_apis::read_write::send_transaction_results> result = http_fwd();
+                        if (std::holds_alternative<fc::exception_ptr>(result)) {
+                            try {
+                                std::get<fc::exception_ptr>(result)->dynamic_rethrow_exception();
+                            } catch (...) { http_plugin::handle_exception("chain", "send_transaction", body, cb); }
+                        } else {
+                            cb(resp_code, fc::variant(std::get<chain_apis::read_write::send_transaction_results>(
+                                    std::move(result))));
+                        }
+                    });
+                }
+            });
+        } catch (...) { http_plugin::handle_exception("chain", "send_transaction", body, cb); }
+    }}}, appbase::exec_queue::read_only);
 
    // Not safe to run in parallel with read-only transactions
    _http_plugin.add_api({

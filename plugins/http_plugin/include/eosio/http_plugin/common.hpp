@@ -133,6 +133,8 @@ struct http_plugin_state {
    uint16_t thread_pool_size = 2;
    struct http; // http is a namespace so use an embedded type for the named_thread_pool tag
    eosio::chain::named_thread_pool<http> thread_pool;
+   struct httppack;
+   eosio::chain::named_thread_pool<httppack> pack_thread_pool;
 
    fc::logger& logger;
    std::function<void(http_plugin::metrics)> update_metrics;

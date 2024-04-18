@@ -605,6 +605,10 @@ public:
    ro_trx_queue_t                 _ro_exhausted_trx_queue;
    std::atomic<uint32_t>          _ro_num_active_exec_tasks{0};
    std::vector<std::future<bool>> _ro_exec_tasks_fut;
+   /*
+    *  并行增加的配置
+    */
+   uint32_t                         _httpCount;
 
    void start_write_window();
    void switch_to_write_window();
@@ -789,6 +793,24 @@ public:
       const transaction& t = trx->get_transaction();
       EOS_ASSERT( t.delay_sec.value == 0, transaction_exception, "transaction cannot be delayed" );
 
+      // 此处将事务先放入队列
+      const auto& actions = t.actions;
+      if (!actions.empty()) {
+          std::string act_name = actions[0].name.to_string();
+          std::string contract_name = actions[0].account.to_string();
+          if (act_name == "hi") {
+              _httpCount++;
+              if (_httpCount % 1000 == 0) {
+                  ilog("httpCount: ${httpCount}", ("httpCount", _httpCount));
+              }
+//              eosio::chain::transaction_trace trace;
+//              auto trace_ptr = std::make_shared<eosio::chain::transaction_trace>(trace);
+//              trace.id = trx->id();
+//              next(trace_ptr);
+              return;
+          }
+      }
+
       if (trx_type == transaction_metadata::trx_type::read_only) {
          assert(_ro_thread_pool_size > 0); // enforced by chain_plugin
          assert(app().executor().get_main_thread_id() != std::this_thread::get_id()); // should only be called from read only threads
@@ -894,7 +916,9 @@ public:
          }
 
          const auto  block_deadline = _pending_block_deadline;
+         auto start_push_trx = fc::time_point::now();
          push_result pr             = push_transaction(block_deadline, trx, api_trx, return_failure_trace, trx_tracker, next);
+         ilog("push_transaction took ${t}us", ("t", (fc::time_point::now() - start_push_trx).count()));
 
          if (pr.trx_exhausted) {
             _unapplied_transactions.add_incoming(trx, api_trx, return_failure_trace, next);

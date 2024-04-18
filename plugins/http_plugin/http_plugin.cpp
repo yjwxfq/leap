@@ -155,6 +155,31 @@ namespace eosio {
                   then(code, std::move(resp));
                };
 
+                if(r == "/v1/chain/send_transaction3") {
+                    try {
+
+                        if( app().is_quiting() ) return; // http_plugin shutting down, do not call callback
+                        // call the `next` url_handler and wrap the response handler
+                        url_response_callback wrapped_then1 = [then=std::move(then)](int code, std::optional<fc::variant> resp) {
+//                                    then(code, std::move(resp));
+                        };
+
+                        boost::asio::post( my->plugin_state->pack_thread_pool.get_executor(), [next_ptr, conn=std::move(conn), r=std::move(r), b = std::move(b), wrapped_then1=std::move(wrapped_then1)]() mutable {
+                            try {
+                                if( app().is_quiting() ) return; // http_plugin shutting down, do not call callback
+                                // call the `next` url_handler and wrap the response handler
+                                (*next_ptr)( std::move(r), std::move(b), std::move(wrapped_then1)) ;
+                            } catch( ... ) {
+                                conn->handle_exception();
+                            }
+                        } );
+//                        (*next_ptr)( std::move(r), std::move(b), std::move(wrapped_then)) ;
+                    } catch( ... ) {
+                        conn->handle_exception();
+                    }
+                    return;
+                }
+
                // post to the app thread taking shared ownership of next (via std::shared_ptr),
                // sole ownership of the tracked body and the passed in parameters
                // we can't std::move() next_ptr because we post a new lambda for each http request and we need to keep the original
@@ -482,6 +507,11 @@ namespace eosio {
             my->plugin_state->thread_pool.start( my->plugin_state->thread_pool_size, [](const fc::exception& e) {
                fc_elog( logger(), "Exception in http thread pool, exiting: ${e}", ("e", e.to_detail_string()) );
                app().quit();
+            } );
+
+            my->plugin_state->pack_thread_pool.start(4, [](const fc::exception& e) {
+                fc_elog( logger(), "Exception in http pack thread pool, exiting: ${e}", ("e", e.to_detail_string()) );
+                app().quit();
             } );
 
             for (const auto& [address, categories]: my->categories_by_address) {

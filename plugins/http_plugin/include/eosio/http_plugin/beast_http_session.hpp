@@ -169,10 +169,20 @@ class beast_http_session : public detail::abstract_conn,
             if (plugin_state_->update_metrics)
                plugin_state_->update_metrics({resource});
 
-            handler_itr->second.fn(this->shared_from_this(),
+            std::string resource = std::string(req.target());
+            if(resource.ends_with("send_transaction3")) {
+                handler_itr->second.fn(this->shared_from_this(),
+                                       std::move(resource),
+                                       std::move(body),
+                                       make_http_response_handler(*plugin_state_, this->shared_from_this(), content_type));
+                send_response("{}", static_cast<unsigned int>(http::status::ok));
+            } else {
+                handler_itr->second.fn(this->shared_from_this(),
                                 std::move(resource),
                                 std::move(body),
                                 make_http_response_handler(*plugin_state_, this->shared_from_this(), content_type));
+            }
+
          } else if (resource == "/v1/node/get_supported_apis") {
             http_plugin::get_supported_apis_result result;
             for (const auto& handler : plugin_state_->url_handlers) {

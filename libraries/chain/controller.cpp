@@ -1695,6 +1695,198 @@ struct controller_impl {
       } FC_CAPTURE_AND_RETHROW((trace))
    } /// push_transaction
 
+   transaction_trace_ptr push_parallel_transaction( const transaction_metadata_ptr& trx,
+                                                    fc::time_point block_deadline,
+                                                    fc::microseconds max_transaction_time,
+                                                    uint32_t billed_cpu_time_us,
+                                                    bool explicit_billed_cpu_time,
+                                                    int64_t subjective_cpu_bill_us ) {
+//       EOS_ASSERT(block_deadline != fc::time_point(), transaction_exception, "deadline cannot be uninitialized");
+
+       transaction_trace_ptr trace;
+       try {
+           auto start = fc::time_point::now();
+           const bool check_auth = !self.skip_auth_check() && !trx->implicit() && !trx->is_read_only();
+//           const fc::microseconds sig_cpu_usage = trx->signature_cpu_usage();
+
+//           if( !explicit_billed_cpu_time ) {
+//               fc::microseconds already_consumed_time( EOS_PERCENT(sig_cpu_usage.count(), conf.sig_cpu_bill_pct) );
+//
+//               if( start.time_since_epoch() <  already_consumed_time ) {
+//                   start = fc::time_point();
+//               } else {
+//                   start -= already_consumed_time;
+//               }
+//           }
+
+           const signed_transaction& trn = trx->packed_trx()->get_signed_transaction();
+           transaction_checktime_timer trx_timer(timer);
+           transaction_context trx_context(self, *trx->packed_trx(), trx->id(), std::move(trx_timer), start, trx->get_trx_type());
+           if ((bool)subjective_cpu_leeway && self.is_speculative_block()) {
+               trx_context.leeway = *subjective_cpu_leeway;
+           }
+           trx_context.block_deadline = block_deadline;
+           trx_context.max_transaction_time_subjective = max_transaction_time;
+           trx_context.explicit_billed_cpu_time = explicit_billed_cpu_time;
+           trx_context.billed_cpu_time_us = billed_cpu_time_us;
+           trx_context.subjective_cpu_bill_us = subjective_cpu_bill_us;
+           trace = trx_context.trace;
+
+           auto handle_exception =[&](const auto& e)
+           {
+               trace->error_code = controller::convert_exception_to_error_code( e );
+               trace->except = e;
+               trace->except_ptr = std::current_exception();
+               trace->elapsed = fc::time_point::now() - trx_context.start;
+           };
+
+           try {
+               if( trx->implicit() ) {
+                   trx_context.init_for_implicit_trx();
+                   trx_context.enforce_whiteblacklist = false;
+               } else {
+                   // TODO 涉及资源校验的都删除
+                   // 涉及 db 的读写
+                   trx_context.init_for_input_trx( trx->packed_trx()->get_unprunable_size(),
+                                                   trx->packed_trx()->get_prunable_size() );
+               }
+
+               trx_context.delay = fc::seconds(trn.delay_sec);
+
+               if( check_auth ) {
+                   authorization.check_authorization(
+                           trn.actions,
+                           trx->recovered_keys(),
+                           {},
+                           trx_context.delay,
+                           [&trx_context](){ trx_context.checktime(); },
+                           false,
+                           trx->is_dry_run()
+                   );
+               }
+               trx_context.exec();
+               trx_context.finalize(); // Automatically rounds up network and CPU usage in trace and bills payers if successful
+
+               ilog("trx ${id} executed", ("id", trx->id()));
+               // 直接保存
+               {
+
+               }
+
+               // TODO 线程内的回退？
+//               auto restore = make_block_restore_point( trx->is_read_only() );
+
+//               trx->billed_cpu_time_us = trx_context.billed_cpu_time_us;
+//               transaction_receipt::status_enum s = (trx_context.delay == fc::seconds(0))
+//                                                    ? transaction_receipt::executed
+//                                                    : transaction_receipt::delayed;
+//               trace->receipt = push_receipt(*trx->packed_trx(), s, trx_context.billed_cpu_time_us, trace->net_usage);
+//               std::get<building_block>(pending->_block_stage)._pending_trx_metas.emplace_back(trx);
+//
+//               // 并行的都是非 read_only 和 非 dry_run
+//               fc::move_append( std::get<building_block>(pending->_block_stage)._action_receipt_digests,
+//                                std::move(trx_context.executed_action_receipt_digests) );
+//
+//               // call the accept signal but only once for this transaction
+//               if (!trx->accepted) {
+//                   trx->accepted = true;
+//                   emit(self.accepted_transaction, trx);
+//               }
+//
+//               dmlog_applied_transaction(trace, &trn);
+//               emit(self.applied_transaction, std::tie(trace, trx->packed_trx()));
+
+//               if ( trx->is_transient() ) {
+//                   // remove trx from pending block by not canceling 'restore'
+//                   trx_context.undo(); // this will happen automatically in destructor, but make it more explicit
+//               } else if ( read_mode != db_read_mode::SPECULATIVE && pending->_block_status == controller::block_status::ephemeral ) {
+//                   // An ephemeral block will never become a full block, but on a producer node the trxs should be saved
+//                   // in the un-applied transaction queue for execution during block production. For a non-producer node
+//                   // save the trxs in the un-applied transaction queue for use during block validation to skip signature
+//                   // recovery.
+//                   restore.cancel();   // maintain trx metas for abort block
+//                   trx_context.undo(); // this will happen automatically in destructor, but make it more explicit
+//               } else {
+//                   restore.cancel();
+//                   trx_context.squash();
+//               }
+
+//               if( !trx->is_transient() ) {
+//                   pending->_block_report.total_net_usage += trace->net_usage;
+//                   pending->_block_report.total_cpu_usage_us += trace->receipt->cpu_usage_us;
+//                   pending->_block_report.total_elapsed_time += trace->elapsed;
+//                   pending->_block_report.total_time += fc::time_point::now() - start;
+//               }
+
+               return trace;
+           } catch( const disallowed_transaction_extensions_bad_block_exception& ) {
+               throw;
+           } catch( const protocol_feature_bad_block_exception& ) {
+               throw;
+           } catch ( const std::bad_alloc& ) {
+               throw;
+           } catch ( const boost::interprocess::bad_alloc& ) {
+               throw;
+           } catch (const transaction_exception& trx_e) {
+               ilog("trx[${id}] transaction_exception ${ee}", ("ee", trx_e.to_detail_string())("id", trx->id()));
+               trace->error_code = trx_e.error_code;
+               trace->except = static_cast<chain_exception>(trx_e);
+               trace->except_ptr = std::current_exception();
+               trace->elapsed = fc::time_point::now() - trx_context.start;
+//               return trace;
+           } catch (const fc::exception& e) {
+               ilog("trx[${id}] fc::exception ${ee}", ("ee", e.to_detail_string())("id", trx->id()));
+               handle_exception(e);
+//               return trace;
+           } catch (const std::exception& e) {
+               auto wrapper = fc::std_exception_wrapper::from_current_exception(e);
+               handle_exception(wrapper);
+           }
+
+           if (!trx->is_transient()) {
+               emit(self.accepted_transaction, trx);
+               dmlog_applied_transaction(trace);
+               emit(self.applied_transaction, std::tie(trace, trx->packed_trx()));
+
+               pending->_block_report.total_net_usage += trace->net_usage;
+               if( trace->receipt ) pending->_block_report.total_cpu_usage_us += trace->receipt->cpu_usage_us;
+               pending->_block_report.total_elapsed_time += trace->elapsed;
+               pending->_block_report.total_time += fc::time_point::now() - start;
+           }
+
+           return trace;
+       } FC_CAPTURE_AND_RETHROW((trace))
+   }
+
+   bool update_transaction_results(const transaction_metadata_ptr& trx, transaction_trace_ptr trace,
+                                   int64_t billed_cpu_time_us, deque<digest_type> executed_action_receipt_digests,
+                                   time_point& start) {
+       const signed_transaction& trn = trx->packed_trx()->get_signed_transaction();
+
+       trx->billed_cpu_time_us = billed_cpu_time_us;
+       transaction_receipt::status_enum s = transaction_receipt::executed;
+       trace->receipt = push_receipt(*trx->packed_trx(), s, billed_cpu_time_us, trace->net_usage);
+       std::get<building_block>(pending->_block_stage)._pending_trx_metas.emplace_back(trx);
+
+       // 并行的都是非 read_only 和 非 dry_run
+       fc::move_append( std::get<building_block>(pending->_block_stage)._action_receipt_digests,
+                        std::move(executed_action_receipt_digests) );
+
+       // call the accept signal but only once for this transaction
+       if (!trx->accepted) {
+           trx->accepted = true;
+           emit(self.accepted_transaction, trx);
+       }
+
+       dmlog_applied_transaction(trace, &trn);
+       emit(self.applied_transaction, std::tie(trace, trx->packed_trx()));
+
+       pending->_block_report.total_net_usage += trace->net_usage;
+       pending->_block_report.total_cpu_usage_us += trace->receipt->cpu_usage_us;
+       pending->_block_report.total_elapsed_time += trace->elapsed;
+       pending->_block_report.total_time += fc::time_point::now() - start;
+   }
+
    void start_block( block_timestamp_type when,
                      uint16_t confirm_block_count,
                      const vector<digest_type>& new_protocol_feature_activations,
@@ -3020,6 +3212,13 @@ transaction_trace_ptr controller::push_transaction( const transaction_metadata_p
    EOS_ASSERT( get_read_mode() != db_read_mode::IRREVERSIBLE, transaction_type_exception, "push transaction not allowed in irreversible mode" );
    EOS_ASSERT( trx && !trx->implicit() && !trx->scheduled(), transaction_type_exception, "Implicit/Scheduled transaction not allowed" );
    return my->push_transaction(trx, block_deadline, max_transaction_time, billed_cpu_time_us, explicit_billed_cpu_time, subjective_cpu_bill_us );
+}
+
+transaction_trace_ptr controller::push_parallel_transaction( const transaction_metadata_ptr& trx,
+                                            fc::time_point block_deadline, fc::microseconds max_transaction_time,
+                                            uint32_t billed_cpu_time_us, bool explicit_billed_cpu_time,
+                                            int64_t subjective_cpu_bill_us ) {
+    return my->push_parallel_transaction(trx, block_deadline, max_transaction_time, billed_cpu_time_us, explicit_billed_cpu_time, subjective_cpu_bill_us);
 }
 
 transaction_trace_ptr controller::push_scheduled_transaction( const transaction_id_type& trxid,

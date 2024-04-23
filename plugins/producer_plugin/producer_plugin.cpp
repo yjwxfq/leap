@@ -362,6 +362,7 @@ class producer_plugin_impl : public std::enable_shared_from_this<producer_plugin
 public:
    producer_plugin_impl(boost::asio::io_service& io)
       : _timer(io)
+      , _parallel_timer(io)
       , _transaction_ack_channel(app().get_channel<compat::channels::transaction_ack>())
       , _ro_timer(io) {}
 
@@ -495,6 +496,7 @@ public:
    block_timing_util::producer_watermarks            _producer_watermarks;
    pending_block_mode                                _pending_block_mode = pending_block_mode::speculating;
    unapplied_transaction_queue                       _unapplied_transactions;
+   unapplied_transaction_queue                       _parallel_transactions;
    size_t                                            _thread_pool_size = config::default_controller_thread_pool_size;
    named_thread_pool<struct prod>                    _thread_pool;
    std::atomic<int32_t>                              _max_transaction_time_ms; // modified by app thread, read by net_plugin thread pool
@@ -605,10 +607,25 @@ public:
    ro_trx_queue_t                 _ro_exhausted_trx_queue;
    std::atomic<uint32_t>          _ro_num_active_exec_tasks{0};
    std::vector<std::future<bool>> _ro_exec_tasks_fut;
-   /*
-    *  并行增加的配置
-    */
-   uint32_t                         _httpCount;
+
+   //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+   //     并行增加的配置
+   /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+   // push_transaction 并行线程池
+   named_thread_pool<struct parallel_push_thread>    _parallel_thread_pool;
+   // push_transaction 并行线程池大小
+   uint32_t _parallel_thread_pool_size{4};
+
+   //
+   boost::asio::deadline_timer                       _parallel_timer;
+
+   // 定时循环执行 process_parallel_transactions
+   void     schedule_parallel_trx_loop();
+   // 处理批量事务
+   bool     process_parallel_transactions();
+
+   /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
    void start_write_window();
    void switch_to_write_window();
@@ -793,24 +810,6 @@ public:
       const transaction& t = trx->get_transaction();
       EOS_ASSERT( t.delay_sec.value == 0, transaction_exception, "transaction cannot be delayed" );
 
-      // 此处将事务先放入队列
-      const auto& actions = t.actions;
-      if (!actions.empty()) {
-          std::string act_name = actions[0].name.to_string();
-          std::string contract_name = actions[0].account.to_string();
-          if (act_name == "hi") {
-              _httpCount++;
-              if (_httpCount % 1000 == 0) {
-                  ilog("httpCount: ${httpCount}", ("httpCount", _httpCount));
-              }
-//              eosio::chain::transaction_trace trace;
-//              auto trace_ptr = std::make_shared<eosio::chain::transaction_trace>(trace);
-//              trace.id = trx->id();
-//              next(trace_ptr);
-              return;
-          }
-      }
-
       if (trx_type == transaction_metadata::trx_type::read_only) {
          assert(_ro_thread_pool_size > 0); // enforced by chain_plugin
          assert(app().executor().get_main_thread_id() != std::this_thread::get_id()); // should only be called from read only threads
@@ -895,6 +894,8 @@ public:
          fc::time_point       bt     = chain.is_building_block() ? chain.pending_block_time() : chain.head_block_time();
          const fc::time_point expire = trx->packed_trx()->expiration().to_time_point();
          if (expire < bt) {
+            // TODO 接收请求直接返回后无法返回超时的事务，需要在日志或者区块内显示失败的状态
+            ilog("expired transaction ${id}, expiration ${e}, block time ${bt}", ("id", id)("e", expire)("bt", bt));
             auto except_ptr = std::static_pointer_cast<fc::exception>(std::make_shared<expired_tx_exception>(
                FC_LOG_MESSAGE(error, "expired transaction ${id}, expiration ${e}, block time ${bt}", ("id", id)("e", expire)("bt", bt))));
             log_trx_results(trx, except_ptr);
@@ -907,6 +908,16 @@ public:
                std::make_shared<tx_duplicate>(FC_LOG_MESSAGE(error, "duplicate transaction ${id}", ("id", id))));
             next(std::move(except_ptr));
             return true;
+         }
+
+         if (trx->is_parallel()) {
+             _parallel_transactions.add_incoming(trx, api_trx, return_failure_trace, next);
+             if(_parallel_transactions.size() % 1000 == 0) {
+                 ilog("_parallel_transactions size: ${size}", ("size", _parallel_transactions.size()));
+             }
+
+             trx_tracker.cancel();
+             return true;
          }
 
          if (!chain.is_building_block()) {
@@ -1195,6 +1206,7 @@ void producer_plugin_impl::plugin_initialize(const boost::program_options::varia
               "incoming-transaction-queue-size-mb ${mb} must be greater than 0", ("mb", max_incoming_transaction_queue_size));
 
    _unapplied_transactions.set_max_transaction_queue_size(max_incoming_transaction_queue_size);
+    _parallel_transactions.set_max_transaction_queue_size(1024*1024*1024);
 
    _disable_subjective_p2p_billing = options.at("disable-subjective-p2p-billing").as<bool>();
    _disable_subjective_api_billing = options.at("disable-subjective-api-billing").as<bool>();
@@ -1290,6 +1302,10 @@ void producer_plugin_impl::plugin_initialize(const boost::program_options::varia
    ilog("Read-only max transaction time ${rot}us set to fit in the effective read-only window ${row}us.",
         ("rot", _ro_max_trx_time_us)("row", _ro_read_window_effective_time_us));
    ilog("read-only-threads ${s}, max read-only trx time to be enforced: ${t} us", ("s", _ro_thread_pool_size)("t", _ro_max_trx_time_us));
+
+    if (options.count("push-parallel-threads")) {
+        _parallel_thread_pool_size = options.at("push-parallel-threads").as<uint32_t>();
+    }
 
    _incoming_block_sync_provider = app().get_method<incoming::methods::block_sync>().register_provider(
       [this](const signed_block_ptr& block, const std::optional<block_id_type>& block_id, const block_state_ptr& bsp) {
@@ -1404,6 +1420,20 @@ void producer_plugin_impl::plugin_startup() {
             _time_tracker.pause(); // start_write_window assumes time_tracker is paused
             start_write_window();
          }
+
+         // parallel transaction thread pool
+         _parallel_thread_pool.start(
+                 _parallel_thread_pool_size,
+                 [](const fc::exception& e) {
+                     fc_elog(_log, "Exception in push transaction parallel thread pool, exiting: ${e}", ("e", e.to_detail_string()));
+                     app().quit();
+                 },
+                 [&]() {
+                     chain.init_thread_local_data();
+                 });
+
+         // parallel 处理的定时任务
+         schedule_parallel_trx_loop();
 
          schedule_production_loop();
 
@@ -2334,6 +2364,213 @@ bool producer_plugin_impl::process_unapplied_trxs(const fc::time_point& deadline
    return !exhausted;
 }
 
+bool producer_plugin_impl::process_parallel_transactions() {
+    auto start = fc::time_point::now();
+
+    if (!_parallel_transactions.empty()) {
+        const chain::controller& chain             = chain_plug->chain();
+        const auto               pending_block_num = chain.pending_block_num();
+        int                      num_success = 0, num_failed = 0, num_processed = 0;
+        auto                     _parallel_trxs_size = _parallel_transactions.size();
+
+        ilog("process_parallel_transactions current trxs num ${d} pending block num: ${pbn}", ("d", _parallel_trxs_size)("pbn", pending_block_num));
+
+        // 记录事务执行结果
+        std::vector<push_result> vec_trxs_results;
+        vec_trxs_results.resize(_parallel_trxs_size);
+
+        auto                     itr                 = _parallel_transactions.begin();
+        auto                     end_itr             = _parallel_transactions.end();
+
+        // TODO 不影响是否可以去掉
+        // 来源 producer_plugin_impl::push_result producer_plugin_impl::push_transaction(
+        chain::subjective_billing& subjective_bill = chain_plug->chain().get_mutable_subjective_billing();
+        uint32_t  iCountSubjectiveEnfor = 0;
+        while (itr != end_itr) {
+            auto first_auth = itr->trx_meta->packed_trx()->get_transaction().first_authorizer();
+            bool api_trx = itr->trx_type == trx_enum_type::incoming_api;
+            bool disable_subjective_enforcement = ( api_trx && _disable_subjective_api_billing) ||
+                                                  (!api_trx && _disable_subjective_p2p_billing) ||
+                                                  subjective_bill.is_account_disabled(first_auth) ||
+                                                  itr->trx_meta->is_transient();
+            if (!disable_subjective_enforcement && _account_fails.failure_limit(first_auth)) {
+                auto except_ptr = std::static_pointer_cast<fc::exception>(std::make_shared<tx_cpu_usage_exceeded>(
+                        FC_LOG_MESSAGE(error, "transaction ${id} exceeded failure limit for account ${a} until ${next_reset_time}",
+                                       ("id", itr->trx_meta->id())("a", first_auth)
+                                               ("next_reset_time", _account_fails.next_reset_timepoint(chain.head_block_num(), chain.head_block_time())))));
+                log_trx_results(itr->trx_meta, except_ptr);
+                vec_trxs_results[iCountSubjectiveEnfor].failed = true;
+            }
+
+            fc::microseconds max_trx_time = fc::milliseconds(_max_transaction_time_ms.load());
+            if (max_trx_time.count() < 0)
+                max_trx_time = fc::microseconds::maximum();
+
+            int64_t sub_bill = 0;
+            if (!disable_subjective_enforcement)
+                sub_bill = subjective_bill.get_subjective_bill(first_auth, fc::time_point::now());
+
+            auto prev_billed_cpu_time_us = itr->trx_meta->billed_cpu_time_us;
+            if (in_producing_mode() && prev_billed_cpu_time_us > 0) {
+                const auto& rl = chain.get_resource_limits_manager();
+                if (!subjective_bill.is_account_disabled(first_auth) && !rl.is_unlimited_cpu(first_auth)) {
+                    int64_t prev_billed_plus100_us = prev_billed_cpu_time_us + EOS_PERCENT(prev_billed_cpu_time_us, 100 * config::percent_1);
+                    if (prev_billed_plus100_us < max_trx_time.count())
+                        max_trx_time = fc::microseconds(prev_billed_plus100_us);
+                }
+            }
+
+            ++itr;
+            ++iCountSubjectiveEnfor;
+        }
+
+        // 记录原始的队列中的数据
+        std::vector<transaction_metadata_ptr> vec_origin_trxs;
+        vec_origin_trxs.reserve(_parallel_trxs_size);
+        std::vector<std::future<transaction_trace_ptr>> futures;
+        futures.reserve(_parallel_trxs_size);
+
+        // TODO
+        // validate_db_available_size
+
+
+        const block_timestamp_type block_time        = calculate_pending_block_time();
+        _pending_block_deadline = block_timing_util::calculate_producing_block_deadline(_produce_block_cpu_effort, block_time);
+        fc::microseconds max_trx_time = fc::milliseconds(_max_transaction_time_ms.load());
+
+        itr                 = _parallel_transactions.begin();
+        end_itr             = _parallel_transactions.end();
+
+        while (itr != end_itr) {
+            vec_origin_trxs.push_back(std::move(itr->trx_meta));
+            itr = _parallel_transactions.erase(itr);
+
+//            using recover_keys_future = std::future<transaction_metadata_ptr>;
+            auto fu = post_async_task(_parallel_thread_pool.get_executor(),
+                                      [self = this,
+                                       trx=vec_origin_trxs[num_processed],
+                                       chain_plug=chain_plug,
+                                       _pending_block_deadline=_pending_block_deadline,
+                                       max_trx_time=max_trx_time](){
+                chain::controller& chain             = chain_plug->chain();
+                try {
+                    auto result = chain.push_parallel_transaction(
+                            trx, _pending_block_deadline, max_trx_time, 0, false, 0);
+                    return result;
+                } catch (const std::exception& e) {
+                    ilog(">>>>>> [exception ${e}]", ("e", e.what()));
+                }
+
+
+            });
+
+            futures.push_back(std::move(fu));
+            num_processed++;
+        }
+
+        std::vector<transaction_trace_ptr> results;
+        for(auto& future : futures) {
+            // 如何没有返回，此处会卡住主线程导致主线程的任务无法继续
+            results.push_back(future.get()); // 等待任务完成并获取结果
+        }
+
+        for(auto& r: results) {
+            if(r->error_code.has_value()) {
+                num_failed++;
+            } else {
+                num_success++;
+            }
+        }
+
+        ilog("Processed ${m} of ${n} parallel transactions, Success ${success}/${n}, Failed/Dropped ${failed}/${n}",
+                ("m", num_processed)("n", _parallel_trxs_size)("success", num_success)("failed", num_failed));
+
+
+
+//        const block_timestamp_type block_time        = calculate_pending_block_time();
+//        auto block_deadline = block_timing_util::calculate_producing_block_deadline(_produce_block_cpu_effort, block_time);
+//
+//        // 先取出，确定顺序，后续写入根据这个来
+//        while (itr != end_itr) {
+////            ilog(">>>>>> [while not empty ${id}]", ("id", itr->trx_meta->id()));
+//            vec_trxs.push_back(std::move(itr->trx_meta));
+//            vec_next_funcs.push_back(std::move(itr->next));
+//
+//            bool _return_failure_trace = itr->return_failure_trace;
+//
+//            // 删除队列中的
+//            itr = _parallel_transactions.erase(itr);
+//
+//            _parallel_exec_tasks_fut.emplace_back(post_async_task(
+//                    _parallel_thread_pool.get_executor(),
+//                    [self = this, trx=vec_trxs[num_processed], block_deadline, next{std::move(itr->next)}]() {
+//                        return self->push_parallel_transaction(trx, block_deadline, next);
+//
+//                    }));
+//
+//            num_processed++;
+//        }
+//
+//        ilog("cur parallel size: ${d}", ("d", _parallel_transactions.size()));
+//
+//        bool all_done = false;
+//        while (!all_done) {
+//            all_done = true; // 假设所有任务都完成了
+//            for (auto& fut : _parallel_exec_tasks_fut) {
+//                if(!fut.valid()) {
+//                    break;
+//                }
+//                // 检查future是否完成
+//                if (fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+//                    all_done = false; // 如果有任何未完成的任务，则设置为false
+//                }
+//            }
+//            // 可选：在这里做一些有意义的工作或者简单地暂停一下
+//            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 防止密集轮询
+//        }
+//
+//        chain::controller& _chain             = chain_plug->chain();
+//        parallel_trace_ptr_and_digest tmp;
+//        for(int i = 0; i < vec_trxs.size(); i++) {
+//            _chain.update_pending_for_parallel_trx(vec_trxs[i], tmp, start);
+//        }
+//        for(int i = 0; i < vec_trxs.size(); i++) {
+//            for (auto& pr: _parallel_exec_tasks_fut) {
+//                if(!pr.valid()) {
+//                    ilog(">>>>>> invalid future in _parallel_exec_tasks_fut ${num}", ("num", i));
+//                    break;
+//                }
+//                parallel_trace_ptr_and_digest real = pr.get();
+//                if (real.trace == nullptr) {
+//                    ilog(">>>>>> invalid trace struct in _parallel_exec_tasks_fut ${num}", ("num", i));
+//                } else {
+//                    if (real.trace->error_code == 9999) {
+//                        break;
+//                    }
+//
+//                    const auto& id = real.trace->id;
+//                    if(id == vec_trxs[i]->id()) {
+//                        chain::controller& _chain             = chain_plug->chain();
+////                    ilog(" >>>>> update_pending_for_parallel_trx >>>");
+//                        _chain.update_pending_for_parallel_trx(vec_trxs[i], real, start);
+//                        break;
+//                    }
+//                }
+//
+//            }
+//        }
+
+//        itr = _parallel_transactions.begin();
+//        while (itr != end_itr) {
+//            itr = _parallel_transactions.erase(itr);
+//        }
+
+//        ilog("Processed ${m} of ${n} parallel transactions, Applied ${applied}, Failed/Dropped ${failed}",
+//                ("m", num_processed)("n", unapplied_trxs_size)("applied", num_applied)("failed", num_failed));
+    }
+    return true;
+}
+
 bool producer_plugin_impl::retire_deferred_trxs(const fc::time_point& deadline) {
    int   num_applied    = 0;
    int   num_failed     = 0;
@@ -2538,6 +2775,18 @@ void producer_plugin_impl::schedule_production_loop() {
    }
 
    _time_tracker.add_other_time();
+}
+
+void producer_plugin_impl::schedule_parallel_trx_loop() {
+    _parallel_timer.expires_from_now(boost::posix_time::milliseconds(100));
+    _parallel_timer.async_wait(app().executor().wrap(
+            priority::medium_high, exec_queue::read_write, [weak_this = weak_from_this()](const boost::system::error_code& ec) {
+                auto self = weak_this.lock();
+                if (self && ec != boost::asio::error::operation_aborted) {
+                    auto result = self->process_parallel_transactions();
+                    self->schedule_parallel_trx_loop();
+                }
+            }));
 }
 
 void producer_plugin_impl::schedule_maybe_produce_block(bool exhausted) {

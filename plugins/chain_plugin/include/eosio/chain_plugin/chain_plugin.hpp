@@ -879,6 +879,8 @@ public:
    };
    void send_transaction2(send_transaction2_params params, chain::plugin_interface::next_function<send_transaction_results> next);
 
+   void send_transaction3(send_transaction_params params, chain::plugin_interface::next_function<send_transaction_results> next);
+
 };
 
  //support for --key_types [sha256,ripemd160] and --encoding [dec/hex]

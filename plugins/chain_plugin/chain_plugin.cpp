@@ -2197,8 +2197,35 @@ void api_base::send_transaction_gen(API &api, send_transaction_params_t params, 
       auto ptrx = std::make_shared<packed_transaction>();
       auto resolver = caching_resolver(make_resolver(api.db, api.abi_serializer_max_time, throw_on_yield::yes));
       try {
-         abi_serializer::from_variant(params.transaction, *ptrx, resolver, api.abi_serializer_max_time);
-      } EOS_RETHROW_EXCEPTIONS(packed_transaction_type_exception, "Invalid packed transaction")
+          abi_serializer::from_variant(params.transaction, *ptrx, resolver, api.abi_serializer_max_time);
+//      } EOS_RETHROW_EXCEPTIONS(packed_transaction_type_exception, "Invalid packed transaction")
+      } catch(const std::bad_alloc &) {
+          throw;
+      }catch(const boost::interprocess::bad_alloc &) {
+          throw;
+      }catch(eosio::chain::chain_exception & e) {
+          do {
+              e.append_log(fc::log_message(fc::log_context(fc::log_level::warn, "_file_name_", 2201, "_function_name_"),
+                                           "Invalid packed transaction", fc::mutable_variant_object()));
+              throw;
+          }
+          while (0);
+      }catch(fc::exception & e) {
+          packed_transaction_type_exception new_exception(
+                  fc::log_message(fc::log_context(fc::log_level::warn, "_file_name_", 2201, "_function_name_"),
+                                  "Invalid packed transaction", fc::mutable_variant_object()));
+          for (const auto &log: e. get_log()) { new_exception. append_log(log); }
+          throw new_exception;
+      }catch(const std::exception &e){
+          packed_transaction_type_exception fce(
+                  fc::log_message(fc::log_context(fc::log_level::warn, "_file_name_", 2201, "_function_name_"),
+                                  "Invalid packed transaction" " (${what})", fc::mutable_variant_object()("what", e. what())));
+          throw fce;
+      }catch(...){
+          throw fc::unhandled_exception(
+                  fc::log_message(fc::log_context(fc::log_level::warn, "_file_name_", 2201, "_function_name_"),
+                                  "Invalid packed transaction", fc::mutable_variant_object()), std::current_exception());
+      }
 
       bool retry = false;
       std::optional<uint16_t> retry_num_blocks;
@@ -2284,6 +2311,15 @@ void read_write::send_transaction2(read_write::send_transaction2_params params, 
                                            .trx_type             = transaction_metadata::trx_type::input,
                                            .transaction          = std::move(params.transaction) };
    return send_transaction_gen(*this, std::move(gen_params), std::move(next));
+}
+
+void read_write::send_transaction3(read_write::send_transaction_params params, next_function<read_write::send_transaction_results> next) {
+    send_transaction_params_t gen_params { .return_failure_trace = false,
+            .retry_trx            = false,
+            .retry_trx_num_blocks = std::nullopt,
+            .trx_type             = transaction_metadata::trx_type::parallel_trx,
+            .transaction          = std::move(params) };
+    return send_transaction_gen(*this, std::move(gen_params), std::move(next));
 }
 
 read_only::get_abi_results read_only::get_abi( const get_abi_params& params, const fc::time_point& )const {

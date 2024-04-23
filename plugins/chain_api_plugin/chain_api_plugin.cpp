@@ -164,7 +164,7 @@ void chain_api_plugin::plugin_startup() {
             auto params = parse_params<chain_apis::read_write::send_transaction_params, http_params_types::params_required>(
                     body);
             using http_fwd_t = std::function<chain::t_or_exception<chain_apis::read_write::send_transaction_results>()>;
-            rw_api.send_transaction(std::move(params), [&_http_plugin, cb = std::move(cb), body = std::move(body)](
+            rw_api.send_transaction3(std::move(params), [&_http_plugin, cb = std::move(cb), body = std::move(body)](
                     const chain::next_function_variant<chain_apis::read_write::send_transaction_results> &result)mutable {
                 if (std::holds_alternative<fc::exception_ptr>(result)) {
                     try {

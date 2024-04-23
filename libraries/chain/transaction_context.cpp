@@ -52,7 +52,9 @@ namespace eosio { namespace chain {
    ,net_usage(trace->net_usage)
    ,pseudo_start(s)
    {
-      if (!c.skip_db_sessions() && !is_read_only()) {
+      // TODO
+      // 并行不能直接 undo_session
+      if (!c.skip_db_sessions() && !is_read_only() && !is_parallel()) {
          undo_session.emplace(c.mutable_db().start_undo_session(true));
       }
       trace->id = id;
@@ -85,6 +87,20 @@ namespace eosio { namespace chain {
    void transaction_context::init(uint64_t initial_net_usage)
    {
       EOS_ASSERT( !is_initialized, transaction_exception, "cannot initialize twice" );
+
+      if(is_parallel()) {
+          // 默认设置超时为 1 天
+          _deadline = start + fc::hours(24);
+
+          auto& rl = control.get_mutable_resource_limits_manager();
+          objective_duration_limit = fc::microseconds( rl.get_block_cpu_limit() );
+
+          transaction_timer.start( _deadline );
+          checktime(); // Fail early if deadline has already been exceeded
+
+          is_initialized = true;
+          return;
+      }
 
       // set maximum to a semi-valid deadline to allow for pause math and conversion to dates for logging
       if( block_deadline == fc::time_point::maximum() ) block_deadline = start + fc::hours(24*7*52);
@@ -290,7 +306,7 @@ namespace eosio { namespace chain {
 
       init( initial_net_usage );
       if ( !is_read_only() ) {
-         record_transaction( id, trx.expiration );
+//         record_transaction( id, trx.expiration );
       }
    }
 

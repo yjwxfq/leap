@@ -91,6 +91,7 @@ namespace eosio { namespace chain {
          bool is_dry_run()const { return trx_type == transaction_metadata::trx_type::dry_run; };
          bool is_read_only()const { return trx_type == transaction_metadata::trx_type::read_only; };
          bool is_transient()const { return trx_type == transaction_metadata::trx_type::read_only || trx_type == transaction_metadata::trx_type::dry_run; };
+         bool is_parallel()const { return trx_type == transaction_metadata::trx_type::parallel_trx; };
 
       private:
 

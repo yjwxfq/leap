@@ -146,6 +146,11 @@ namespace eosio { namespace chain {
                                                  uint32_t billed_cpu_time_us, bool explicit_billed_cpu_time,
                                                  int64_t subjective_cpu_bill_us );
 
+         transaction_trace_ptr push_parallel_transaction( const transaction_metadata_ptr& trx,
+                                               fc::time_point deadline, fc::microseconds max_transaction_time,
+                                               uint32_t billed_cpu_time_us, bool explicit_billed_cpu_time,
+                                               int64_t subjective_cpu_bill_us );
+
          /**
           * Attempt to execute a specific transaction in our deferred trx database
           *
@@ -153,6 +158,12 @@ namespace eosio { namespace chain {
          transaction_trace_ptr push_scheduled_transaction( const transaction_id_type& scheduled,
                                                            fc::time_point block_deadline, fc::microseconds max_transaction_time,
                                                            uint32_t billed_cpu_time_us, bool explicit_billed_cpu_time );
+
+         // TODO 先为这些函数增加 mutex 后续看性能再优化执行逻辑
+         // next_global_sequence
+         std::mutex g_global_seq_lock;
+         // next_recv_sequence
+         std::mutex g_recv_seq_lock;
 
          struct block_report {
             size_t             total_net_usage = 0;

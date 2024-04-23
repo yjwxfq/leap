@@ -83,6 +83,7 @@ void apply_context::exec_one()
          receiver_account = &db.get<account_metadata_object,by_name>( receiver );
          if( !(context_free && control.skip_trx_checks()) ) {
             privileged = receiver_account->is_privileged();
+            // TODO 将 token 合约改造为 native 模式
             auto native = control.find_apply_handler( receiver, act->account, act->name );
             if( native ) {
                if( trx_context.enforce_whiteblacklist && control.is_speculative_block() ) {
@@ -1046,6 +1047,7 @@ uint64_t apply_context::next_global_sequence() {
       // To avoid confusion of duplicated global sequence number, hard code to be 0.
       return 0;
    } else {
+      std::lock_guard<std::mutex> lock( control.g_global_seq_lock );
       db.modify( p, [&]( auto& dgp ) {
          ++dgp.global_action_sequence;
       });
@@ -1058,6 +1060,7 @@ uint64_t apply_context::next_recv_sequence( const account_metadata_object& recei
       // To avoid confusion of duplicated receive sequence number, hard code to be 0.
       return 0;
    } else {
+      std::lock_guard<std::mutex> lock( control.g_recv_seq_lock );
       db.modify( receiver_account, [&]( auto& ra ) {
          ++ra.recv_sequence;
       });

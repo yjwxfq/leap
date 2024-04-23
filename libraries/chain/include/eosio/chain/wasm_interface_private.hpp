@@ -168,6 +168,7 @@ struct eosvmoc_tier {
          const uint8_t&       vm_version,
          transaction_context& trx_context )
       {
+          // TODO 多线程的时候，如何先初始化 cache
          wasm_cache_index::iterator it = wasm_instantiation_cache.find( boost::make_tuple(code_hash, vm_type, vm_version) );
          if (it != wasm_instantiation_cache.end()) {
             // An instantiated module's module should never be null.

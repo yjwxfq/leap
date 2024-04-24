@@ -264,6 +264,10 @@ struct controller_impl {
    map< account_name, map<handler_key, apply_handler> >   apply_handlers;
    unordered_map< builtin_protocol_feature_t, std::function<void(controller_impl&)>, enum_hash<builtin_protocol_feature_t> > protocol_feature_activation_handlers;
 
+   // 保存起来保存 action_receipt_digests
+   unordered_map<string, digests_t > map_action_receipt_digests;
+   std::shared_mutex mutex_map_action_receipt_digests;
+
 
    void pop_block() {
       auto prev = fork_db.get_block( head->header.previous );
@@ -1767,10 +1771,11 @@ struct controller_impl {
                trx_context.exec();
                trx_context.finalize(); // Automatically rounds up network and CPU usage in trace and bills payers if successful
 
-               ilog("trx ${id} executed", ("id", trx->id()));
+//               ilog("trx ${id} executed", ("id", trx->id()));
                // 直接保存
                {
-
+                    std::unique_lock lock(mutex_map_action_receipt_digests);
+                    map_action_receipt_digests[trx->id().str()] = std::move(trx_context.executed_action_receipt_digests);
                }
 
                // TODO 线程内的回退？
@@ -1859,18 +1864,29 @@ struct controller_impl {
    }
 
    bool update_transaction_results(const transaction_metadata_ptr& trx, transaction_trace_ptr trace,
-                                   int64_t billed_cpu_time_us, deque<digest_type> executed_action_receipt_digests,
-                                   time_point& start) {
+                                   int64_t billed_cpu_time_us, time_point& start) {
        const signed_transaction& trn = trx->packed_trx()->get_signed_transaction();
 
        trx->billed_cpu_time_us = billed_cpu_time_us;
        transaction_receipt::status_enum s = transaction_receipt::executed;
+//               std::get<building_block>(pending->_block_stage)._action_receipt_digests = itr->second;
        trace->receipt = push_receipt(*trx->packed_trx(), s, billed_cpu_time_us, trace->net_usage);
        std::get<building_block>(pending->_block_stage)._pending_trx_metas.emplace_back(trx);
 
+       {
+           std::shared_lock lock(mutex_map_action_receipt_digests);
+           auto itr = map_action_receipt_digests.find(trx->id().str());
+           if (itr != map_action_receipt_digests.end()) {
+               fc::move_append( std::get<building_block>(pending->_block_stage)._action_receipt_digests,
+                                std::move(itr->second) );
+           } else {
+               ilog("trx[${id}] not found in map_action_receipt_digests", ("id", trx->id()));
+           }
+       }
+
        // 并行的都是非 read_only 和 非 dry_run
-       fc::move_append( std::get<building_block>(pending->_block_stage)._action_receipt_digests,
-                        std::move(executed_action_receipt_digests) );
+//       fc::move_append( std::get<building_block>(pending->_block_stage)._action_receipt_digests,
+//                        std::move(executed_action_receipt_digests) );
 
        // call the accept signal but only once for this transaction
        if (!trx->accepted) {
@@ -3219,6 +3235,11 @@ transaction_trace_ptr controller::push_parallel_transaction( const transaction_m
                                             uint32_t billed_cpu_time_us, bool explicit_billed_cpu_time,
                                             int64_t subjective_cpu_bill_us ) {
     return my->push_parallel_transaction(trx, block_deadline, max_transaction_time, billed_cpu_time_us, explicit_billed_cpu_time, subjective_cpu_bill_us);
+}
+
+bool controller::update_transaction_results(const transaction_metadata_ptr& trx, transaction_trace_ptr trace,
+                                        int64_t billed_cpu_time_us, time_point& start) {
+    return my->update_transaction_results(trx, trace, billed_cpu_time_us, start);
 }
 
 transaction_trace_ptr controller::push_scheduled_transaction( const transaction_id_type& trxid,

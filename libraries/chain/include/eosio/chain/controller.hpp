@@ -150,8 +150,11 @@ namespace eosio { namespace chain {
                                                fc::time_point deadline, fc::microseconds max_transaction_time,
                                                uint32_t billed_cpu_time_us, bool explicit_billed_cpu_time,
                                                int64_t subjective_cpu_bill_us );
+         // 更新并行的事务结果到 pending
+        bool update_transaction_results(const transaction_metadata_ptr& trx, transaction_trace_ptr trace,
+                                       int64_t billed_cpu_time_us, time_point& start);
 
-         /**
+       /**
           * Attempt to execute a specific transaction in our deferred trx database
           *
           */

@@ -154,7 +154,13 @@ struct eosvmoc_tier {
             // When in write window (either read only threads are not enabled or
             // they are not schedued to run), only main thread is processing
             // transactions. No need to lock.
-            return get_or_build_instantiated_module(code_hash, vm_type, vm_version, trx_context);
+            if(trx_context.is_parallel()) {
+                // 并行需要加锁
+                std::lock_guard g(instantiation_cache_mutex);
+                return get_or_build_instantiated_module(code_hash, vm_type, vm_version, trx_context);
+            } else {
+                return get_or_build_instantiated_module(code_hash, vm_type, vm_version, trx_context);
+            }
          } else {
             std::lock_guard g(instantiation_cache_mutex);
             return get_or_build_instantiated_module(code_hash, vm_type, vm_version, trx_context);
@@ -168,7 +174,6 @@ struct eosvmoc_tier {
          const uint8_t&       vm_version,
          transaction_context& trx_context )
       {
-          // TODO 多线程的时候，如何先初始化 cache
          wasm_cache_index::iterator it = wasm_instantiation_cache.find( boost::make_tuple(code_hash, vm_type, vm_version) );
          if (it != wasm_instantiation_cache.end()) {
             // An instantiated module's module should never be null.

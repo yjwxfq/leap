@@ -1206,7 +1206,7 @@ void producer_plugin_impl::plugin_initialize(const boost::program_options::varia
               "incoming-transaction-queue-size-mb ${mb} must be greater than 0", ("mb", max_incoming_transaction_queue_size));
 
    _unapplied_transactions.set_max_transaction_queue_size(max_incoming_transaction_queue_size);
-    _parallel_transactions.set_max_transaction_queue_size(1024*1024*1024);
+   _parallel_transactions.set_max_transaction_queue_size(1024*1024*1024);
 
    _disable_subjective_p2p_billing = options.at("disable-subjective-p2p-billing").as<bool>();
    _disable_subjective_api_billing = options.at("disable-subjective-api-billing").as<bool>();
@@ -2427,8 +2427,9 @@ bool producer_plugin_impl::process_parallel_transactions() {
         // 记录原始的队列中的数据
         std::vector<transaction_metadata_ptr> vec_origin_trxs;
         vec_origin_trxs.reserve(_parallel_trxs_size);
-        std::vector<std::future<transaction_trace_ptr>> futures;
-        futures.reserve(_parallel_trxs_size);
+//        std::vector<std::future<transaction_trace_ptr>> futures;
+//        futures.reserve(_parallel_trxs_size);
+        std::map<transaction_id_type, std::future<transaction_trace_ptr>> map_push_parallel_futures;
 
         // TODO
         // validate_db_available_size
@@ -2464,23 +2465,28 @@ bool producer_plugin_impl::process_parallel_transactions() {
 
             });
 
-            futures.push_back(std::move(fu));
+            map_push_parallel_futures[vec_origin_trxs[num_processed]->id()] = std::move(fu);
+//            futures.push_back(std::move(fu));
             num_processed++;
         }
 
-        std::vector<transaction_trace_ptr> results;
-        for(auto& future : futures) {
-            // 如何没有返回，此处会卡住主线程导致主线程的任务无法继续
-            results.push_back(future.get()); // 等待任务完成并获取结果
-        }
+//        std::vector<transaction_trace_ptr> results;
+//        for(auto& future : futures) {
+//            // 如何没有返回，此处会卡住主线程导致主线程的任务无法继续
+//            results.push_back(future.get()); // 等待任务完成并获取结果
+//        }
 
-        for(auto& r: results) {
+        for(auto& ori_trx: vec_origin_trxs) {
+            auto r = std::move(map_push_parallel_futures[ori_trx->id()]).get();
             if(r->error_code.has_value()) {
                 num_failed++;
             } else {
                 num_success++;
+                chain_plug->chain().update_transaction_results(ori_trx, r, 100, start);
             }
+
         }
+
 
         ilog("Processed ${m} of ${n} parallel transactions, Success ${success}/${n}, Failed/Dropped ${failed}/${n}",
                 ("m", num_processed)("n", _parallel_trxs_size)("success", num_success)("failed", num_failed));

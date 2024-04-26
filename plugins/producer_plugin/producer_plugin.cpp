@@ -1106,6 +1106,8 @@ void producer_plugin::set_program_options(
           "Disable subjective CPU billing for API transactions")
          ("producer-threads", bpo::value<uint16_t>()->default_value(my->_thread_pool_size),
           "Number of worker threads in producer thread pool")
+         ("push-parallel-threads", bpo::value<uint32_t>()->default_value(my->_parallel_thread_pool_size),
+          "Number of worker threads of parallel transactions")
          ("snapshots-dir", bpo::value<std::filesystem::path>()->default_value("snapshots"),
           "the location of the snapshots directory (absolute path or relative to application data dir)")
          ("read-only-threads", bpo::value<uint32_t>(),
